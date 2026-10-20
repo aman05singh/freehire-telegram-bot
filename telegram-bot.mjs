@@ -55,7 +55,7 @@ if (!botToken) {
 
 const TELEGRAM_API = `https://api.telegram.org/bot${botToken}`;
 
-// User State (Sessions, Filters, Bookmarks)
+// User State (Sessions, Filters, Bookmarks, and Active Page Cache)
 const userSessions = new Map();
 
 function getSession(chatId) {
@@ -65,13 +65,15 @@ function getSession(chatId) {
       company_slug: null,
       page: 0,
       pageSize: 4,
+      currentJobs: [], // Cache of jobs currently on screen [0, 1, 2, 3]
+      savedListCache: [], // Cache for bookmarks screen
       filters: {
         work_mode: null,  // 'remote' or null
         maxDays: null,    // 1, 7, 14, 30, or null
         seniority: null,  // 'junior', 'mid', 'senior', 'lead', or null
-        is_tech: 'tech',  // 'tech' or null
+        is_tech: null,    // null = all jobs (prevents query over-filtering)
       },
-      saved: new Map(),
+      saved: new Map(), // key: public_slug -> job object
     });
   }
   return userSessions.get(chatId);
@@ -163,9 +165,13 @@ async function callTelegram(method, payload) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    return await res.json();
+    const json = await res.json();
+    if (!json.ok) {
+      console.error(`[Telegram API Error] ${method}:`, json.description);
+    }
+    return json;
   } catch (err) {
-    console.error(`Telegram ${method} error:`, err.message);
+    console.error(`Telegram ${method} network error:`, err.message);
     return { ok: false, error: err.message };
   }
 }
@@ -207,9 +213,11 @@ function escapeHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// --- View: Search Results with Pagination ---
+// --- View: Search Results with Index-Based Buttons (< 15 bytes) ---
 function buildResultsView(result, session) {
   const { jobs, total, offset, limit } = result;
+  session.currentJobs = jobs; // Save in session so buttons use safe index: save:0, save:1
+
   const currentPage = Math.floor(offset / limit) + 1;
   const totalPages = Math.ceil(total / limit) || 1;
 
@@ -236,7 +244,10 @@ function buildResultsView(result, session) {
       inline_keyboard: [
         [
           { text: '⚙️ Change Filters', callback_data: 'menu:filters' },
-          { text: '🔄 Reset All Filters', callback_data: 'filter:reset' }
+          { text: '🔄 Reset Filters', callback_data: 'filter:reset' }
+        ],
+        [
+          { text: '🏠 Main Menu', callback_data: 'menu:start' }
         ]
       ]
     };
@@ -248,13 +259,13 @@ function buildResultsView(result, session) {
   jobs.forEach((job, index) => {
     const jobNum = offset + index + 1;
     const skills = (job.skills || []).slice(0, 5).join(', ');
-    const location = job.location || (job.countries?.join(', ').toUpperCase()) || 'Location not specified';
+    const location = escapeHtml(job.location || (job.countries?.join(', ').toUpperCase()) || 'Location not specified');
     const remoteBadge = job.regions?.includes('worldwide') || job.location?.toLowerCase().includes('remote') ? ' 🌐 <b>[REMOTE]</b>' : '';
     const dateStr = formatPostingDate(job);
     const isSaved = session.saved.has(job.public_slug);
 
     text += `<b>${jobNum}. ${escapeHtml(job.title)}</b>${remoteBadge}\n`;
-    text += `🏢 <b>${escapeHtml(job.company || 'Unknown')}</b> • 📍 ${escapeHtml(location)}\n`;
+    text += `🏢 <b>${escapeHtml(job.company || 'Unknown')}</b> • 📍 ${location}\n`;
     text += `📅 <i>${dateStr}</i>\n`;
     if (skills) text += `⚡ Skills: <code>${escapeHtml(skills)}</code>\n`;
     
@@ -266,9 +277,10 @@ function buildResultsView(result, session) {
     }
     text += `\n`;
 
+    // SHORT callback_data (e.g. save:0, save:1) -> strictly under 10 bytes!
     inlineKeyboard.push([
-      { text: `🚀 Apply #${jobNum}`, url: job.url },
-      { text: isSaved ? `⭐ Saved #${jobNum}` : `☆ Save #${jobNum}`, callback_data: `save:${job.public_slug}` }
+      { text: `🚀 Apply #${jobNum}`, url: job.url || 'https://freehire.me' },
+      { text: isSaved ? `⭐ Saved #${jobNum}` : `☆ Save #${jobNum}`, callback_data: `save:${index}` }
     ]);
   });
 
@@ -286,12 +298,14 @@ function buildResultsView(result, session) {
 
   // Tools row
   inlineKeyboard.push([
-    { text: '⚙️ Filter Options', callback_data: 'menu:filters' },
+    { text: '⚙️ Filters', callback_data: 'menu:filters' },
     { text: '⭐ My Bookmarks', callback_data: 'menu:saved' }
   ]);
+  
+  // Return to Main Menu row
   inlineKeyboard.push([
-    { text: '🧭 Browse Categories', callback_data: 'menu:browse' },
-    { text: '📊 Market Insights', callback_data: 'menu:insights' }
+    { text: '🏠 Main Menu', callback_data: 'menu:start' },
+    { text: '🧭 Categories', callback_data: 'menu:browse' }
   ]);
 
   return { text, keyboard: { inline_keyboard: inlineKeyboard } };
@@ -305,8 +319,8 @@ function buildFilterMenuView(session) {
   text += `Customize your search parameters below. Results will update automatically:\n\n`;
   text += `• <b>Work Mode:</b> ${filters.work_mode ? filters.work_mode.toUpperCase() : 'Any (Remote + Onsite)'}\n`;
   text += `• <b>Posted Within:</b> ${filters.maxDays ? `Last ${filters.maxDays} days` : 'Any time'}\n`;
-  text += `• <b>Seniority Level:</b> ${filters.seniority ? filters.seniority.toUpperCase() : 'Any level'}\n`;
-  text += `• <b>Tech Filter:</b> ${filters.is_tech === 'tech' ? 'IT / Software Only' : 'All Roles'}\n`;
+  text += `• <b>Seniority Level:</b> ${filters.seniority ? filters.seniority.toUpperCase() : 'Any level'}\n\n`;
+  text += `<i>Tap any button to toggle:</i>`;
 
   const keyboard = {
     inline_keyboard: [
@@ -325,8 +339,11 @@ function buildFilterMenuView(session) {
         { text: filters.seniority === 'senior' ? '✅ Senior' : 'Senior', callback_data: 'filter:level:senior' },
       ],
       [
-        { text: '🔄 Reset All Filters', callback_data: 'filter:reset' },
+        { text: '🔄 Reset Filters', callback_data: 'filter:reset' },
         { text: '🔍 View Results', callback_data: 'page:0' },
+      ],
+      [
+        { text: '🏠 Main Menu', callback_data: 'menu:start' }
       ]
     ]
   };
@@ -337,13 +354,13 @@ function buildFilterMenuView(session) {
 // --- View: Browse Categories ---
 function buildBrowseCategoriesView() {
   const text = `🧭 <b>Browse Top Tech Crafts & Fields</b>\n\n` +
-    `Tap any category below to immediately load live vacancies:`;
+    `Tap any craft below to immediately load live vacancies:`;
 
   const keyboard = {
     inline_keyboard: [
       [
         { text: '💻 Frontend (React/Vue/Svelte)', callback_data: 'quick:Frontend React' },
-        { text: '⚙️ Backend (Python/Go/Java)', callback_data: 'quick:Backend developer' }
+        { text: '⚙️ Backend (Python/Go/Java)', callback_data: 'quick:Backend Python' }
       ],
       [
         { text: '🤖 AI & Machine Learning', callback_data: 'quick:AI Machine Learning' },
@@ -358,7 +375,7 @@ function buildBrowseCategoriesView() {
         { text: '🎓 Junior & Internships', callback_data: 'quick:Junior intern' }
       ],
       [
-        { text: '🔙 Back to Main Menu', callback_data: 'menu:start' }
+        { text: '🏠 Main Menu', callback_data: 'menu:start' }
       ]
     ]
   };
@@ -400,6 +417,7 @@ async function buildInsightsView() {
           { text: '🔍 Search Cloud Jobs', callback_data: 'quick:Cloud' }
         ],
         [
+          { text: '🏠 Main Menu', callback_data: 'menu:start' },
           { text: '🔙 Back to Search', callback_data: 'page:0' }
         ]
       ]
@@ -409,7 +427,7 @@ async function buildInsightsView() {
   } catch (err) {
     return {
       text: `📊 <b>Market Insights</b>\n\nUnable to fetch latest telemetry: ${err.message}`,
-      keyboard: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'page:0' }]] }
+      keyboard: { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:start' }]] }
     };
   }
 }
@@ -417,13 +435,15 @@ async function buildInsightsView() {
 // --- View: Bookmarked Jobs ---
 function buildSavedJobsView(session) {
   const savedList = Array.from(session.saved.values());
+  session.savedListCache = savedList; // Cache for unsave:0, unsave:1 callback
 
   if (savedList.length === 0) {
     return {
       text: `⭐ <b>Saved Bookmarks</b>\n\nYou haven't bookmarked any jobs yet.\nSearch for jobs and tap <b>☆ Save</b> on any card to keep track of roles you want to apply for!`,
       keyboard: {
         inline_keyboard: [
-          [{ text: '🔍 Search Jobs Now', callback_data: 'page:0' }]
+          [{ text: '🔍 Search Jobs Now', callback_data: 'quick:Python remote' }],
+          [{ text: '🏠 Main Menu', callback_data: 'menu:start' }]
         ]
       }
     };
@@ -436,13 +456,17 @@ function buildSavedJobsView(session) {
     text += `<b>${index + 1}. ${escapeHtml(job.title)}</b>\n`;
     text += `🏢 ${escapeHtml(job.company)} • 📍 ${escapeHtml(job.location || 'Remote')}\n\n`;
 
+    // SHORT callback: unsave:0, unsave:1 -> under 10 bytes!
     inlineKeyboard.push([
-      { text: `🚀 Apply #${index + 1}`, url: job.url },
-      { text: `🗑️ Remove`, callback_data: `unsave:${job.public_slug}` }
+      { text: `🚀 Apply #${index + 1}`, url: job.url || 'https://freehire.me' },
+      { text: `🗑️ Remove`, callback_data: `unsave:${index}` }
     ]);
   });
 
-  inlineKeyboard.push([{ text: '🔍 Back to Search', callback_data: 'page:0' }]);
+  inlineKeyboard.push([
+    { text: '🔍 Back to Search', callback_data: 'page:0' },
+    { text: '🏠 Main Menu', callback_data: 'menu:start' }
+  ]);
 
   return { text, keyboard: { inline_keyboard: inlineKeyboard } };
 }
@@ -455,7 +479,9 @@ async function handleCompanySearch(chatId, companyName) {
     const companies = data.data || [];
 
     if (companies.length === 0) {
-      await sendMessage(chatId, `🏢 No company profile found matching "<b>${escapeHtml(companyName)}</b>".\n\nTry searching by the job title instead!`);
+      await sendMessage(chatId, `🏢 No company profile found matching "<b>${escapeHtml(companyName)}</b>".\n\nTry searching by the job title instead!`, {
+        inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:start' }]]
+      });
       return;
     }
 
@@ -468,14 +494,16 @@ async function handleCompanySearch(chatId, companyName) {
 
     const keyboard = {
       inline_keyboard: [
-        [{ text: `🔍 View All ${comp.job_count} Jobs at ${comp.name}`, callback_data: `compjobs:${comp.slug}` }],
-        [{ text: '🔙 Back to Search', callback_data: 'menu:start' }]
+        [{ text: `🔍 View All ${comp.job_count} Jobs at ${comp.name}`, callback_data: `compjobs:${comp.slug.slice(0, 45)}` }],
+        [{ text: '🏠 Main Menu', callback_data: 'menu:start' }]
       ]
     };
 
     await sendMessage(chatId, text, keyboard);
   } catch (err) {
-    await sendMessage(chatId, `⚠️ Error searching company: ${err.message}`);
+    await sendMessage(chatId, `⚠️ Error searching company: ${err.message}`, {
+      inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:start' }]]
+    });
   }
 }
 
@@ -545,7 +573,9 @@ async function handleMessage(msg) {
           { text: '⚙️ Set Filters', callback_data: 'menu:filters' },
           { text: '🧭 Browse Categories', callback_data: 'menu:browse' }
         ],
-        [{ text: '🔍 Search Python Remote', callback_data: 'quick:Python remote' }]
+        [
+          { text: '🏠 Main Menu', callback_data: 'menu:start' }
+        ]
       ]
     };
 
@@ -609,16 +639,22 @@ async function handleMessage(msg) {
 
   try {
     const result = await searchFreehire(session.query, session, 0, session.pageSize);
-    result.jobs.forEach(j => session.saved.set(`cache:${j.public_slug}`, j));
-
     const view = buildResultsView(result, session);
+    
+    let editOk = false;
     if (statusMsg && statusMsg.result?.message_id) {
-      await editMessage(chatId, statusMsg.result.message_id, view.text, view.keyboard);
-    } else {
+      const editRes = await editMessage(chatId, statusMsg.result.message_id, view.text, view.keyboard);
+      if (editRes && editRes.ok) editOk = true;
+    }
+
+    if (!editOk) {
       await sendMessage(chatId, view.text, view.keyboard);
     }
   } catch (err) {
-    await sendMessage(chatId, `⚠️ Search error: ${err.message}`);
+    console.error('Search error:', err);
+    await sendMessage(chatId, `⚠️ Search error: ${err.message}`, {
+      inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:start' }]]
+    });
   }
 }
 
@@ -637,7 +673,32 @@ async function handleCallbackQuery(cbQuery) {
 
   if (data === 'menu:start') {
     await answerCallback(cbQuery.id);
-    await handleMessage({ chat: { id: chatId }, text: '/start' });
+    const welcome = `👋 <b>Welcome to Freehire Job Radar Pro!</b>\n\n` +
+      `Search <b>3.3M+ real IT jobs</b> crawled directly from company career portals (Workday, Greenhouse, Lever, Ashby, iCIMS).\n\n` +
+      `⚡ <b>Quick Start:</b> Tap an option below or just type what role you want:`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '🐍 Python Remote', callback_data: 'quick:Python remote' },
+          { text: '⚛️ React / Frontend', callback_data: 'quick:React frontend' },
+        ],
+        [
+          { text: '🌐 WordPress', callback_data: 'quick:WordPress' },
+          { text: '☁️ DevOps / Cloud', callback_data: 'quick:DevOps cloud' },
+        ],
+        [
+          { text: '🧭 Browse Categories', callback_data: 'menu:browse' },
+          { text: '📊 Market Insights', callback_data: 'menu:insights' },
+        ],
+        [
+          { text: '⚙️ Configure Filters', callback_data: 'menu:filters' },
+          { text: '⭐ My Bookmarks', callback_data: 'menu:saved' }
+        ]
+      ]
+    };
+
+    await editMessage(chatId, messageId, welcome, keyboard);
     return;
   }
 
@@ -660,14 +721,15 @@ async function handleCallbackQuery(cbQuery) {
     session.query = '';
     session.company_slug = slug;
     session.page = 0;
-    await answerCallback(cbQuery.id, `Loading jobs for ${slug}...`);
+    await answerCallback(cbQuery.id, `Loading jobs...`);
     try {
       const result = await searchFreehire('', session, 0, session.pageSize);
-      result.jobs.forEach(j => session.saved.set(`cache:${j.public_slug}`, j));
       const view = buildResultsView(result, session);
       await editMessage(chatId, messageId, view.text, view.keyboard);
     } catch (err) {
-      await editMessage(chatId, messageId, `⚠️ Error: ${err.message}`);
+      await editMessage(chatId, messageId, `⚠️ Error: ${err.message}`, {
+        inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:start' }]]
+      });
     }
     return;
   }
@@ -680,11 +742,12 @@ async function handleCallbackQuery(cbQuery) {
     await answerCallback(cbQuery.id, `Searching for ${query}...`);
     try {
       const result = await searchFreehire(session.query, session, 0, session.pageSize);
-      result.jobs.forEach(j => session.saved.set(`cache:${j.public_slug}`, j));
       const view = buildResultsView(result, session);
       await editMessage(chatId, messageId, view.text, view.keyboard);
     } catch (err) {
-      await editMessage(chatId, messageId, `⚠️ Error: ${err.message}`);
+      await editMessage(chatId, messageId, `⚠️ Error: ${err.message}`, {
+        inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:start' }]]
+      });
     }
     return;
   }
@@ -699,41 +762,53 @@ async function handleCallbackQuery(cbQuery) {
 
     try {
       const result = await searchFreehire(session.query, session, offset, session.pageSize);
-      result.jobs.forEach(j => session.saved.set(`cache:${j.public_slug}`, j));
       const view = buildResultsView(result, session);
       await editMessage(chatId, messageId, view.text, view.keyboard);
     } catch (err) {
-      await editMessage(chatId, messageId, `⚠️ Error: ${err.message}`);
+      await editMessage(chatId, messageId, `⚠️ Error: ${err.message}`, {
+        inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:start' }]]
+      });
     }
     return;
   }
 
-  // Bookmark / Save Handler
+  // Bookmark / Save Handler by Safe Index (save:0, save:1, etc.)
   if (data.startsWith('save:')) {
-    const slug = data.replace('save:', '');
-    const cachedJob = session.saved.get(`cache:${slug}`);
+    const idx = parseInt(data.replace('save:', ''), 10);
+    const job = session.currentJobs && session.currentJobs[idx];
     
-    if (session.saved.has(slug)) {
-      session.saved.delete(slug);
-      await answerCallback(cbQuery.id, 'Removed from saved jobs!');
-    } else if (cachedJob) {
-      session.saved.set(slug, cachedJob);
-      await answerCallback(cbQuery.id, '⭐ Saved to your bookmarks!');
-    } else {
-      await answerCallback(cbQuery.id, 'Saved!');
-    }
+    if (job) {
+      if (session.saved.has(job.public_slug)) {
+        session.saved.delete(job.public_slug);
+        await answerCallback(cbQuery.id, 'Removed from saved jobs!');
+      } else {
+        session.saved.set(job.public_slug, job);
+        await answerCallback(cbQuery.id, '⭐ Saved to bookmarks!');
+      }
 
-    const offset = session.page * session.pageSize;
-    const result = await searchFreehire(session.query, session, offset, session.pageSize);
-    const view = buildResultsView(result, session);
-    await editMessage(chatId, messageId, view.text, view.keyboard);
+      // Re-render current results page with updated star
+      const offset = session.page * session.pageSize;
+      const result = await searchFreehire(session.query, session, offset, session.pageSize);
+      const view = buildResultsView(result, session);
+      await editMessage(chatId, messageId, view.text, view.keyboard);
+    } else {
+      await answerCallback(cbQuery.id, 'Job reference expired. Please search again.');
+    }
     return;
   }
 
+  // Remove Bookmark by Safe Index (unsave:0, unsave:1)
   if (data.startsWith('unsave:')) {
-    const slug = data.replace('unsave:', '');
-    session.saved.delete(slug);
-    await answerCallback(cbQuery.id, 'Job removed.');
+    const idx = parseInt(data.replace('unsave:', ''), 10);
+    const job = session.savedListCache && session.savedListCache[idx];
+    
+    if (job) {
+      session.saved.delete(job.public_slug);
+      await answerCallback(cbQuery.id, 'Removed from saved jobs.');
+    } else {
+      await answerCallback(cbQuery.id, 'Done.');
+    }
+
     const view = buildSavedJobsView(session);
     await editMessage(chatId, messageId, view.text, view.keyboard);
     return;
@@ -759,15 +834,15 @@ async function handleCallbackQuery(cbQuery) {
     const parts = data.split(':');
     if (parts[1] === 'mode') {
       session.filters.work_mode = parts[2] === 'any' ? null : parts[2];
-      await answerCallback(cbQuery.id, `Work mode set to: ${parts[2]}`);
+      await answerCallback(cbQuery.id, `Work mode: ${parts[2]}`);
     } else if (parts[1] === 'days') {
       session.filters.maxDays = parseInt(parts[2], 10);
       await answerCallback(cbQuery.id, `Date filter: last ${parts[2]} days`);
     } else if (parts[1] === 'level') {
       session.filters.seniority = parts[2];
-      await answerCallback(cbQuery.id, `Seniority set to: ${parts[2]}`);
+      await answerCallback(cbQuery.id, `Seniority: ${parts[2]}`);
     } else if (parts[1] === 'reset') {
-      session.filters = { work_mode: null, maxDays: null, seniority: null, is_tech: 'tech' };
+      session.filters = { work_mode: null, maxDays: null, seniority: null, is_tech: null };
       await answerCallback(cbQuery.id, 'All filters reset.');
     }
 
@@ -784,7 +859,7 @@ async function pollTelegram() {
   let offset = 0;
   console.log('🤖 Freehire Job Radar Pro is actively listening on Telegram...');
   console.log('• 24/7 Keep-Alive self-pinger active');
-  console.log('• Pagination, Categories, Company search & Telemetry enabled');
+  console.log('• Pagination, Categories, Bookmarks & Main Menu buttons fully enabled');
 
   while (true) {
     try {
