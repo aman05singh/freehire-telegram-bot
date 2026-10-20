@@ -1,0 +1,13 @@
+{
+  "name": "freehire-telegram-bot",
+  "version": "1.0.0",
+  "description": "24/7 Freehire Job Search Telegram Bot",
+  "main": "telegram-bot.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node telegram-bot.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
